@@ -289,7 +289,7 @@ class SweAgent(BaseInstalledAgent):
                 "WRAPPER\n"
                 "chmod +x /usr/local/bin/sweagent && "
                 "cat > /etc/profile.d/testbed-conda.sh << 'EOF'\n"
-                'if [ -z "$CONDA_DEFAULT_ENV" ] && [ -d "/opt/miniconda3/envs/testbed" ]; then\n'
+                'if [ -z "${CONDA_DEFAULT_ENV:-}" ] && [ -d "/opt/miniconda3/envs/testbed" ]; then\n'
                 '    if [ -f "/opt/miniconda3/etc/profile.d/conda.sh" ]; then\n'
                 '        . "/opt/miniconda3/etc/profile.d/conda.sh"\n'
                 "        conda activate testbed 2>/dev/null || true\n"
@@ -371,17 +371,15 @@ class SweAgent(BaseInstalledAgent):
             if key in os.environ:
                 env[key] = os.environ[key]
 
-        if not any(
-            k in env
-            for k in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "TOGETHER_API_KEY"]
-        ):
-            try:
-                api_key_vars = get_api_key_var_names_from_model_name(self.model_name)
-                for api_key_var in api_key_vars:
-                    if api_key_var in os.environ:
-                        env[api_key_var] = os.environ[api_key_var]
-            except ValueError:
-                pass
+        api_key_var_for_sweagent: str | None = None
+        try:
+            api_key_vars = get_api_key_var_names_from_model_name(self.model_name)
+            for api_key_var in api_key_vars:
+                if api_key_var in os.environ:
+                    env[api_key_var] = os.environ[api_key_var]
+                    api_key_var_for_sweagent = api_key_var_for_sweagent or api_key_var
+        except ValueError:
+            pass
 
         is_hosted_vllm = self.model_name.startswith("hosted_vllm/")
 
@@ -395,6 +393,54 @@ class SweAgent(BaseInstalledAgent):
             f"{instruction}\n"
             f"{heredoc}\n"
         )
+        repo_dir_cmd = (
+            "if [ -d /testbed ]; then\n"
+            "  HARBOR_SWE_REPO=/testbed\n"
+            "elif [ -d /home/dev ]; then\n"
+            "  HARBOR_SWE_REPO=/home/dev\n"
+            "else\n"
+            "  HARBOR_SWE_REPO=$(pwd)\n"
+            "fi\n"
+        )
+        init_repo_cmd = (
+            'cd "$HARBOR_SWE_REPO"\n'
+            'if [ ! -d .git ]; then\n'
+            '  git init >/dev/null\n'
+            '  git config user.email "harbor@example.com"\n'
+            '  git config user.name "Harbor"\n'
+            '  git add .\n'
+            '  git commit -m "Initial task state" >/dev/null || true\n'
+            "fi\n"
+        )
+        auth_diagnostic_cmd = (
+            'if [ -n "${OPENROUTER_API_KEY:-}" ]; then\n'
+            '  echo "SWE-agent auth diagnostic: OPENROUTER_API_KEY is present" >> /logs/agent/swe-agent.txt\n'
+            "else\n"
+            '  echo "SWE-agent auth diagnostic: OPENROUTER_API_KEY is missing" >> /logs/agent/swe-agent.txt\n'
+            "fi\n"
+        )
+        litellm_registry_path: str | None = None
+        litellm_registry_cmd = ""
+        if self.model_name == "openrouter/openai/gpt-5.3-codex":
+            litellm_registry_path = "/logs/agent/litellm_model_registry.json"
+            litellm_registry = {
+                self.model_name: {
+                    "input_cost_per_token": 0.00000175,
+                    "output_cost_per_token": 0.000014,
+                    "litellm_provider": "openrouter",
+                    "max_input_tokens": 400000,
+                    "max_output_tokens": 128000,
+                    "max_tokens": 128000,
+                    "mode": "chat",
+                    "supports_function_calling": True,
+                    "supports_tool_choice": True,
+                }
+            }
+            litellm_registry_cmd = (
+                f"cat > '{litellm_registry_path}' << 'HARBOR_LITELLM_MODEL_REGISTRY'\n"
+                f"{json.dumps(litellm_registry, indent=2)}\n"
+                "HARBOR_LITELLM_MODEL_REGISTRY\n"
+            )
 
         cmd_parts = [
             "sweagent run",
@@ -402,9 +448,12 @@ class SweAgent(BaseInstalledAgent):
             f"--problem_statement.path={instruction_path}",
             "--env.deployment.type=local",
             "--output_dir=/logs/agent/swe-agent-output",
-            "$(if [ -d /testbed ]; then echo '--env.repo.type=preexisting --env.repo.repo_name=/testbed'; "
-            "else echo '--env.repo.path=$(pwd)'; fi)",
+            '"--env.repo.type=preexisting"',
+            '"--env.repo.repo_name=${HARBOR_SWE_REPO}"',
         ]
+
+        if api_key_var_for_sweagent:
+            cmd_parts.append(f"--agent.model.api_key='${api_key_var_for_sweagent}'")
 
         download_config_cmd = ""
         config_path = "/opt/sweagent-configs/default.yaml"
@@ -421,6 +470,10 @@ class SweAgent(BaseInstalledAgent):
                 config_path = env["SWEAGENT_CONFIG"]
 
         cmd_parts.append(f'--config="{config_path}"')
+        if litellm_registry_path:
+            cmd_parts.append(
+                f"--agent.model.litellm_model_registry={litellm_registry_path}"
+            )
 
         if is_hosted_vllm:
             # Set defaults for hosted vllm (0 = unlimited) unless overridden by kwargs
@@ -445,7 +498,11 @@ class SweAgent(BaseInstalledAgent):
             ". /etc/profile.d/testbed-conda.sh\n"
             f"{download_config_cmd}"
             f"{write_instruction_cmd}"
-            f"{command} 2>&1 | stdbuf -oL tee /logs/agent/swe-agent.txt\n"
+            f"{repo_dir_cmd}"
+            f"{init_repo_cmd}"
+            f"{litellm_registry_cmd}"
+            f"{auth_diagnostic_cmd}"
+            f"{command} 2>&1 | stdbuf -oL tee -a /logs/agent/swe-agent.txt\n"
         )
 
         try:

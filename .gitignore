@@ -230,3 +230,5 @@ src/harbor/viewer/static/
 apps/*
 !apps/viewer/
 .agents/
+
+jobs_verus_spec_gym/
